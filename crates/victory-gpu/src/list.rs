@@ -637,7 +637,7 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
+            let format = DXGI_FORMAT(crate::resource::pc_format(format) as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -1445,5 +1445,278 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_translates_console_depth_format() {
+        use std::ffi::c_void;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let queue_iid = crate::object::guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let mut queue = null;
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct HeapProps {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        let heap = HeapProps {
+            kind: 1,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 0,
+            visible_nodes: 0,
+        };
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ResDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let src_desc = ResDesc {
+            dimension: 3, // TEXTURE_2D
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 118, // console D24_UNORM_S8_UINT -> R24G8_TYPELESS on host
+            sample_count: 4,
+            sample_quality: 0,
+            layout: 0,
+            flags: 2, // ALLOW_DEPTH_STENCIL
+        };
+        let dst_desc = ResDesc {
+            sample_count: 1,
+            flags: 0,
+            ..src_desc
+        };
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let (mut src, mut dst) = (null, null);
+        // Clear value in console format 118 (depth = 0.25).
+        let clear_val = [118u32, 0.25f32.to_bits(), 0, 0, 0];
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const src_desc).cast(),
+                0x10, // DEPTH_WRITE
+                clear_val.as_ptr().cast(),
+                &res_iid,
+                &mut src,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const dst_desc).cast(),
+                0, // COMMON
+                null.cast(),
+                &res_iid,
+                &mut dst,
+            ),
+            S_OK
+        );
+
+        let mut dsv_heap = null;
+        let heap_desc = [3u32, 1, 0, 0, 0, 0, 0, 0]; // DSV, count 1, plus zero placement
+        let dsv_heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &dsv_heap_iid,
+                &mut dsv_heap
+            ),
+            S_OK
+        );
+        let dsv = slot::<extern "system" fn(This) -> u64>(dsv_heap, 0x48)(dsv_heap);
+        let dsv_desc = [118u32, 5, 0, 0, 0, 0]; // D24_UNORM_S8_UINT, DSV_DIMENSION_TEXTURE2DMS
+        crate::descriptor::create_dsv(null, src, &dsv_desc, dsv);
+
+        // Clear MSAA depth to 0.25, then resolve with console format 119
+        // (R24_UNORM_X8_TYPELESS on console -> 46 on PC).
+        slot::<extern "system" fn(This, u64, u32, f32, u8, u32, *const c_void)>(list, 0x198)(
+            list,
+            dsv,
+            1, // D3D12_CLEAR_FLAG_DEPTH
+            0.25,
+            0,
+            0,
+            null.cast(),
+        );
+        slot::<extern "system" fn(This, This, u32, This, u32, u32)>(list, 0x98)(
+            list, dst, 0, src, 0, 119,
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // Read back plane 0 of the resolved host texture and check the cleared depth (~0.25).
+        let host_dst = crate::resource::host_resource(dst).unwrap();
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total_bytes = 0u64;
+        // SAFETY: a live host texture and output pointers.
+        unsafe {
+            let d = host_dst.GetDesc();
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                1,
+                0,
+                Some(&mut fp),
+                None,
+                None,
+                Some(&mut total_bytes),
+            );
+        }
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: total_bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut rb: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+        }
+        let readback = rb.unwrap();
+        let back = host.new_list().unwrap();
+        let (_, before) = crate::resource::host_transition(dst, 0x800).unwrap();
+        let out_to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: fp,
+            },
+        };
+        let out_from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::ManuallyDrop::new(Some(host_dst.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: an open list, live resources, and copyable footprint from the host device.
+        unsafe {
+            back.list.ResourceBarrier(&[crate::host::transition(
+                host_dst,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            back.list
+                .CopyTextureRegion(&out_to, 0, 0, 0, &out_from, None);
+        }
+        back.close();
+        host.execute(&[&back]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy finished (execute waits); the buffer spans `total_bytes`.
+        let words = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: total_bytes as usize,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u32>(), 4)
+        };
+        let expected = (0.25f32 * ((1u32 << 24) - 1) as f32).round() as u32;
+        assert!(
+            (words[0] & 0x00ff_ffff).abs_diff(expected) <= 1,
+            "resolved depth {:#x} != expected {expected:#x}",
+            words[0] & 0x00ff_ffff
+        );
+        // SAFETY: unmapping what we mapped.
+        unsafe { readback.Unmap(0, None) };
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(dsv_heap), 0);
+        assert_eq!(release(dst), 0);
+        assert_eq!(release(src), 0);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(queue), 0);
     }
 }
