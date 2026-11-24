@@ -864,8 +864,20 @@ impl<'a> Lower<'a> {
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+                let mask_lo = self
+                    .x
+                    .st
+                    .highs
+                    .get(&phi.value)
+                    .copied()
+                    .unwrap_or(phi.value);
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                    _ if self.mask_data == MaskData::Console
+                        && self.x.st.active.contains(&mask_lo) =>
+                    {
+                        Val::Missing("a lane mask")
+                    }
                     _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
                     Reg::Scc => {
                         let v = self.s.m.phi(self.cur, self.s.t.i1);
@@ -7099,9 +7111,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7128,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7150,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7417,5 +7429,48 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn sop_and_loop_phi_active_masks_lower_as_data() {
+        let layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        // Wave64 compute: scalar branch skips directly to s_xor_b64(..., -1),
+        // then reads the mask via v_mbcnt_lo_u32_b32.
+        let xor_words = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF84_0001, // s_cbranch_scc0 -> bb1
+            S_ENDPGM,
+            0x8984_C16A, // bb1: s_xor_b64 s[4:5], vcc, -1
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, s4, 0
+            0x0001_0004,
+            S_ENDPGM,
+        ];
+        let l1 = lower_wave(&xor_words, layout.clone(), Vec::new(), true).unwrap();
+        assert!(l1.wave_ops);
+
+        // Wave64 compute: scalar branch skips to an if/else join of two active
+        // masks (non-EXEC phi) and reads the joined mask as data via s_bcnt1.
+        let phi_words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF84_0003, // s_cbranch_scc0 -> else
+            0x7D84_0080, // then: v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_046A, // s_mov_b64 s[2:3], vcc
+            0xBF82_0002, // s_branch -> merge
+            0x7D88_0000, // else: v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_046A, // s_mov_b64 s[2:3], vcc
+            0xBE84_1002, // merge: s_bcnt1_i32_b64 s4, s[2:3]
+            0x7E02_0204, // v_mov_b32 v1, s4
+            S_ENDPGM,
+        ];
+        let l2 = lower_wave(&phi_words, layout, Vec::new(), true).unwrap();
+        assert!(l2.wave_ops);
     }
 }

@@ -413,6 +413,33 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Execution mask under which each active mask's low dword was defined.
+    active_exec: Map<Value, Bool>,
+    /// Reaching `EXEC` at block entry / exit, when known.
+    entry_exec: Vec<Option<Bool>>,
+    exit_exec: Vec<Option<Bool>>,
+    /// Subset-preserving scalar mask ops to close over in [`Lanes::propagate_active`].
+    sop_rules: Vec<ActiveSop>,
+}
+
+#[derive(Clone, Copy)]
+enum MaskArg {
+    Key(Key),
+    Bool(Bool),
+}
+
+#[derive(Clone, Copy)]
+enum ActiveSopOp {
+    Mov(MaskArg),
+    And(MaskArg, MaskArg),
+    AndN2(MaskArg),
+    Or(MaskArg, MaskArg),
+}
+
+struct ActiveSop {
+    key: Key,
+    op: ActiveSopOp,
+    exec: Bool,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -432,6 +459,7 @@ struct SopMasks {
     derived: bool,
     /// For branches: SCC ("result is not zero") per lane.
     scc: Option<Bool>,
+    active_op: Option<ActiveSopOp>,
 }
 
 const MAX_ROUNDS: usize = 256;
@@ -476,6 +504,10 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            active_exec: Map::default(),
+            entry_exec: vec![None; blocks.len()],
+            exit_exec: vec![None; blocks.len()],
+            sop_rules: Vec::new(),
         })
     }
 
@@ -488,6 +520,10 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.active_exec.clear();
+        self.entry_exec.fill(None);
+        self.exit_exec.fill(None);
+        self.sop_rules.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -503,6 +539,7 @@ impl<'a> Lanes<'a> {
             };
             self.masks.insert((lo, hi), Bool::TRUE);
             self.active.insert(lo);
+            self.active_exec.insert(lo, Bool::TRUE);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
@@ -518,13 +555,13 @@ impl<'a> Lanes<'a> {
             }
             self.first[b] = c;
             // EXEC joined at the block's entry holds the lanes that arrive.
-            for phi in &p.blocks[b].phis {
-                if phi.reg == Reg::S(EXEC) {
-                    self.active.insert(phi.value);
-                }
+            if let Some(k) = self.phi_key(b, EXEC) {
+                let e = self.mask(k).0;
+                self.active.insert(k.0);
+                self.active_exec.insert(k.0, e);
             }
-            // EXEC where known in this block (read or written so far).
-            let mut now = None;
+            let mut now = self.block_entry_exec(b, n);
+            self.entry_exec[b] = now;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if inst.read(Reg::S(EXEC)).is_some() {
                     let e = self.exec(inst);
@@ -536,13 +573,153 @@ impl<'a> Lanes<'a> {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
+            self.exit_exec[b] = now;
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
                 self.when[b] = Some(self.branch(last));
             }
         }
+        self.promote_pure_mask_phis();
         execs
+    }
+
+    fn phi_key(&self, block: usize, code: u8) -> Option<Key> {
+        let phis = &self.p.blocks[block].phis;
+        self.key(|r| phis.iter().find(|q| q.reg == r).map(|q| q.value), code)
+    }
+
+    fn block_entry_exec(&mut self, b: usize, rpo_idx: usize) -> Option<Bool> {
+        if b == 0 {
+            return Some(Bool::TRUE);
+        }
+        if let Some(k) = self.phi_key(b, EXEC) {
+            return Some(self.mask(k).0);
+        }
+        let block = &self.p.blocks[b];
+        for inst in &block.insts {
+            if inst.read(Reg::S(EXEC)).is_some() {
+                return Some(self.exec(inst));
+            }
+            if inst.write(Reg::S(EXEC)).is_some() || inst.write(Reg::S(EXEC + 1)).is_some() {
+                break;
+            }
+        }
+        if !block.preds.is_empty() && block.preds.iter().all(|&q| self.index[q] < rpo_idx) {
+            let first = self.exit_exec[block.preds[0]]?;
+            if block.preds[1..]
+                .iter()
+                .all(|&q| self.exit_exec[q] == Some(first))
+            {
+                return Some(first);
+            }
+        }
+        None
+    }
+
+    fn is_zero_mask_def(&self, k: Key) -> bool {
+        if self.other.get(&k) == Some(&Bool::FALSE) {
+            return true;
+        }
+        let d0 = self.defs.get(&k.0).copied();
+        let d1 = self.defs.get(&k.1).copied();
+        let Some((b, i)) = d0.filter(|&d| !self.p.wave64 || d1 == Some(d)) else {
+            return false;
+        };
+        let inst = &self.p.blocks[b].insts[i];
+        let width = if self.p.wave64 {
+            "s_mov_b64"
+        } else {
+            "s_mov_b32"
+        };
+        if inst.name() != width {
+            return false;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        matches!(
+            src.first(),
+            Some(Operand::Const(128)) | Some(Operand::Literal(0))
+        )
+    }
+
+    /// Ensures pure lane-mask phis (whose incoming values are all tracked masks
+    /// or `0`) enter [`Self::masks`] even when read only as data.
+    fn promote_pure_mask_phis(&mut self) {
+        let mut cands: Vec<(usize, Key, Vec<Key>)> = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                let Reg::S(c) = phi.reg else { continue };
+                if c == EXEC || c == EXEC + 1 || (self.p.wave64 && !c.is_multiple_of(2)) {
+                    continue;
+                }
+                let Some(k) = self.phi_key(b, c) else {
+                    continue;
+                };
+                if k.0 != phi.value || self.masks.contains_key(&k) {
+                    continue;
+                }
+                let lo = self.phis.get(&k.0).copied();
+                let hi = self.phis.get(&k.1).copied();
+                if matches!((lo, hi), (Some((a, _)), Some((d, _))) if a != d) {
+                    continue;
+                }
+                let args = (0..block.preds.len())
+                    .map(|n| {
+                        let a_lo = lo.map_or(k.0, |(_, i)| block.phis[i].args[n]);
+                        let a_hi = hi.map_or(k.1, |(_, i)| block.phis[i].args[n]);
+                        (a_lo, a_hi)
+                    })
+                    .collect();
+                cands.push((b, k, args));
+            }
+        }
+        if cands.is_empty() {
+            return;
+        }
+        let mut keep: HashSet<Key> = cands.iter().map(|c| c.1).collect();
+        loop {
+            let before = keep.len();
+            cands.retain(|c| {
+                let ok = c.2.iter().all(|a| {
+                    self.masks.contains_key(a) || self.is_zero_mask_def(*a) || keep.contains(a)
+                });
+                if !ok {
+                    keep.remove(&c.1);
+                }
+                ok
+            });
+            if keep.len() == before {
+                break;
+            }
+        }
+        let mut derived: HashSet<Key> = HashSet::new();
+        loop {
+            let before = derived.len();
+            for (_, k, args) in &cands {
+                if !derived.contains(k)
+                    && args
+                        .iter()
+                        .any(|a| self.masks.contains_key(a) || derived.contains(a))
+                {
+                    derived.insert(*k);
+                }
+            }
+            if derived.len() == before {
+                break;
+            }
+        }
+        for (_, k, _) in cands {
+            if !derived.contains(&k) {
+                continue;
+            }
+            if let Some(m) = self.other.remove(&k) {
+                self.masks.insert(k, m);
+            } else {
+                self.mask(k);
+            }
+        }
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
@@ -581,11 +758,120 @@ impl<'a> Lanes<'a> {
         wrong
     }
 
+    fn propagate_active(&mut self) {
+        struct PhiRule {
+            block: usize,
+            key: Key,
+            args: Vec<(usize, Key)>,
+            exec: Bool,
+            invariant_back: bool,
+        }
+        let mut phi_rules = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            let Some(eb) = self.entry_exec[b] else {
+                continue;
+            };
+            let invariant_back = !block.phis.iter().any(|phi| phi.reg == Reg::S(EXEC));
+            for phi in &block.phis {
+                let Reg::S(c) = phi.reg else { continue };
+                if c == EXEC || c == EXEC + 1 || (self.p.wave64 && !c.is_multiple_of(2)) {
+                    continue;
+                }
+                let Some(k) = self.phi_key(b, c) else {
+                    continue;
+                };
+                if k.0 != phi.value
+                    || !self.masks.contains_key(&k)
+                    || self.active_exec.contains_key(&k.0)
+                {
+                    continue;
+                }
+                let lo = self.phis.get(&k.0).copied();
+                let hi = self.phis.get(&k.1).copied();
+                if matches!((lo, hi), (Some((a, _)), Some((d, _))) if a != d) {
+                    continue;
+                }
+                let args = (0..block.preds.len())
+                    .map(|n| {
+                        let a_lo = lo.map_or(k.0, |(_, i)| block.phis[i].args[n]);
+                        let a_hi = hi.map_or(k.1, |(_, i)| block.phis[i].args[n]);
+                        (block.preds[n], (a_lo, a_hi))
+                    })
+                    .collect();
+                phi_rules.push(PhiRule {
+                    block: b,
+                    key: k,
+                    args,
+                    exec: eb,
+                    invariant_back,
+                });
+            }
+        }
+        let sop_rules = std::mem::take(&mut self.sop_rules);
+        let arg_ok = |l: &mut Self, arg: MaskArg, under: Bool| -> bool {
+            match arg {
+                MaskArg::Bool(m) => l.b.implies(m, under),
+                MaskArg::Key(k) => l.key_ok(k, under),
+            }
+        };
+        loop {
+            let mut changed = false;
+            for rule in &sop_rules {
+                if self.active_exec.contains_key(&rule.key.0) {
+                    continue;
+                }
+                let ok = match rule.op {
+                    ActiveSopOp::Mov(a) | ActiveSopOp::AndN2(a) => arg_ok(self, a, rule.exec),
+                    ActiveSopOp::And(a, c) => {
+                        arg_ok(self, a, rule.exec) || arg_ok(self, c, rule.exec)
+                    }
+                    ActiveSopOp::Or(a, c) => {
+                        arg_ok(self, a, rule.exec) && arg_ok(self, c, rule.exec)
+                    }
+                };
+                if ok {
+                    self.active.insert(rule.key.0);
+                    self.active_exec.insert(rule.key.0, rule.exec);
+                    changed = true;
+                }
+            }
+            for rule in &phi_rules {
+                if self.active_exec.contains_key(&rule.key.0) {
+                    continue;
+                }
+                let b_idx = self.index[rule.block];
+                let ok = rule.args.iter().all(|&(q, a)| {
+                    (self.index[q] < b_idx || rule.invariant_back) && self.key_ok(a, rule.exec)
+                });
+                if ok {
+                    self.active.insert(rule.key.0);
+                    self.active_exec.insert(rule.key.0, rule.exec);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn key_ok(&mut self, k: Key, under: Bool) -> bool {
+        if let Some(&m) = self.masks.get(&k).or(self.other.get(&k))
+            && self.b.implies(m, under)
+        {
+            return true;
+        }
+        self.active_exec
+            .get(&k.0)
+            .is_some_and(|&de| self.b.implies(de, under))
+    }
+
     fn finish(
         mut self,
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        self.propagate_active();
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -632,7 +918,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             bools: self.b,
             exits,
@@ -771,7 +1061,7 @@ impl<'a> Lanes<'a> {
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
 
-    fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
+    fn operand_arg(&mut self, inst: &Inst, op: &Operand) -> Option<(MaskArg, Bool, bool)> {
         let wave64 = self.p.wave64;
         let constant = |b: &mut Bools, v: u64| {
             let v = if wave64 { v } else { v & 0xFFFF_FFFF };
@@ -784,7 +1074,8 @@ impl<'a> Lanes<'a> {
         Some(match *op {
             Operand::Scalar { code, .. } if code != NULL => {
                 let k = self.key(|r| inst.read(r), code)?;
-                self.mask(k)
+                let (m, d) = self.mask(k);
+                (MaskArg::Key(k), m, d)
             }
             Operand::Const(c @ 128..=208) => {
                 let v = if c <= 192 {
@@ -792,9 +1083,13 @@ impl<'a> Lanes<'a> {
                 } else {
                     192 - i64::from(c)
                 };
-                (constant(&mut self.b, v as u64), false)
+                let m = constant(&mut self.b, v as u64);
+                (MaskArg::Bool(m), m, false)
             }
-            Operand::Literal(x) => (constant(&mut self.b, u64::from(x)), false),
+            Operand::Literal(x) => {
+                let m = constant(&mut self.b, u64::from(x));
+                (MaskArg::Bool(m), m, false)
+            }
             _ => return None,
         })
     }
@@ -820,12 +1115,12 @@ impl<'a> Lanes<'a> {
         };
         let mut derived = exec_out.is_some() || save.is_some();
         let mut arg = |n: usize, l: &mut Self| {
-            let (m, d) = l.operand(inst, src.get(n)?)?;
+            let (ma, m, d) = l.operand_arg(inst, src.get(n)?)?;
             derived |= d;
-            Some(m)
+            Some((ma, m))
         };
         if let Some(saveexec) = save {
-            let s = arg(0, self)?;
+            let (_, s) = arg(0, self)?;
             let exec = self.exec(inst);
             let new = self.combine(f, s, exec)?;
             let saved = if saveexec { exec } else { new };
@@ -834,34 +1129,45 @@ impl<'a> Lanes<'a> {
                 exec: exec_out.map(|e| (e, new)),
                 derived,
                 scc: Some(new),
+                active_op: None,
             });
         }
-        let (result, scc) = match op {
-            "mov" => (arg(0, self)?, None),
+        let (result, scc, active_op) = match op {
+            "mov" => {
+                let (ma, a) = arg(0, self)?;
+                (a, None, Some(ActiveSopOp::Mov(ma)))
+            }
             "not" => {
-                let a = arg(0, self)?;
+                let (_, a) = arg(0, self)?;
                 let r = self.b.not(a);
-                (r, Some(r))
+                (r, Some(r), None)
             }
             "wqm" => {
-                let a = arg(0, self)?;
+                let (_, a) = arg(0, self)?;
                 let lo = dst.or(exec_out)?.0;
                 let born = self.born(lo);
                 let q = self.b.atom(Atom::Quad(lo), born);
                 let r = self.b.or(a, q);
-                (r, Some(r))
+                (r, Some(r), None)
             }
             "cselect" => {
-                let (a, c) = (arg(0, self)?, arg(1, self)?);
+                let ((ma, a), (mc, c)) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
                 let born = self.born(scc);
                 let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                (self.b.ite(u, a, c), None, Some(ActiveSopOp::Or(ma, mc)))
             }
             _ => {
-                let (a, c) = (arg(0, self)?, arg(1, self)?);
+                let ((ma, a), (mc, c)) = (arg(0, self)?, arg(1, self)?);
                 let r = self.combine(op, a, c)?;
-                (r, Some(r))
+                let aop = match op {
+                    "and" => Some(ActiveSopOp::And(ma, mc)),
+                    "andn2" => Some(ActiveSopOp::AndN2(ma)),
+                    "andn1" => Some(ActiveSopOp::AndN2(mc)),
+                    "or" | "xor" => Some(ActiveSopOp::Or(ma, mc)),
+                    _ => None,
+                };
+                (r, Some(r), aop)
             }
         };
         Some(SopMasks {
@@ -869,6 +1175,7 @@ impl<'a> Lanes<'a> {
             exec: exec_out.map(|e| (e, result)),
             derived,
             scc,
+            active_op,
         })
     }
 
@@ -933,10 +1240,22 @@ impl<'a> Lanes<'a> {
                     for (k, m) in r.dst.into_iter().chain(r.exec) {
                         self.masks.insert(k, m);
                         // EXEC itself holds the lanes that run here.
-                        if r.exec.is_some_and(|e| e.0 == k)
-                            || exec.is_some_and(|e| self.b.implies(m, e))
-                        {
+                        if r.exec.is_some_and(|e| e.0 == k) {
                             self.active.insert(k.0);
+                            self.active_exec.insert(k.0, m);
+                        } else if let Some(e) = exec {
+                            if self.b.implies(m, e) {
+                                self.active.insert(k.0);
+                                self.active_exec.insert(k.0, e);
+                            } else if r.dst.is_some_and(|d| d.0 == k)
+                                && let Some(op) = r.active_op
+                            {
+                                self.sop_rules.push(ActiveSop {
+                                    key: k,
+                                    op,
+                                    exec: e,
+                                });
+                            }
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
@@ -952,8 +1271,8 @@ impl<'a> Lanes<'a> {
                         .strip_suffix(width)
                         .is_some_and(|r| r == "eq_u" || r == "lg_u")
                     && let [a, c] = &src[..]
-                    && let (Some((a, _)), Some((c, _))) =
-                        (self.operand(inst, a), self.operand(inst, c))
+                    && let (Some((_, a, _)), Some((_, c, _))) =
+                        (self.operand_arg(inst, a), self.operand_arg(inst, c))
                 {
                     let ne = self.b.xor(a, c);
                     let m = if rest.starts_with("eq") {
@@ -972,6 +1291,7 @@ impl<'a> Lanes<'a> {
                     let m = l.b.and(exec, a);
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
+                    l.active_exec.insert(k.0, exec);
                 };
                 // A select reads a mask nothing else may: a join of compare
                 // results is resolved here, as for EXEC.
@@ -1230,5 +1550,90 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn sop_masks_in_blocks_without_prior_exec_reads_stay_active() {
+        // Block 1 runs s_xor_b64(..., -1) and s_andn2_b64 before any VALU op
+        // under full entry EXEC: both masks remain active.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF84_0001, // s_cbranch_scc0 -> bb1
+                S_ENDPGM,
+                0x8984_C16A, // bb1: s_xor_b64 s[4:5], vcc, -1 (op=0x13, dst=4, src1=0xC1, src0=0x6A)
+                0x8A86_6A04, // s_andn2_b64 s[6:7], s[4:5], vcc (op=0x15, dst=6, src1=0x6A, src0=4)
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let st = structure(&p).unwrap();
+        let s4 = p.blocks[2].insts[0].write(Reg::S(4)).unwrap();
+        let s6 = p.blocks[2].insts[1].write(Reg::S(6)).unwrap();
+        assert!(st.active.contains(&s4));
+        assert!(st.active.contains(&s6));
+    }
+
+    #[test]
+    fn non_exec_mask_joins_stay_active_only_when_lanes_reach_the_join() {
+        // Uniform loop accumulating active lane bits in s[2:3] (non-EXEC phi).
+        let uniform_loop = build(
+            &[
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7D84_0080, // loop: v_cmp_eq_u32 vcc, 0, v0
+                0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF85_FFFC, // s_cbranch_scc1 -> loop
+                0x7E02_0202, // after: v_mov_b32 v1, s2 (read phi as data)
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let st_uni = structure(&uniform_loop).unwrap();
+        let phi_s2 = uniform_loop.blocks[1]
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(2))
+            .unwrap()
+            .value;
+        assert!(st_uni.masks.contains_key(&phi_s2));
+        assert!(st_uni.active.contains(&phi_s2));
+
+        // Divergent loop: exited lanes leave EXEC and do not reach the header.
+        let divergent_loop = build(
+            &[
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x4A00_0081, // loop: v_add_nc_u32 v0, 1, v0
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+                0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+                0xBF89_FFFB, // s_cbranch_execnz -> loop
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let st_div = structure(&divergent_loop).unwrap();
+        let div_phi_s2 = divergent_loop.blocks[1]
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(2))
+            .unwrap()
+            .value;
+        assert!(!st_div.active.contains(&div_phi_s2));
+
+        // Mask negation under narrowed EXEC can set bits outside EXEC.
+        let narrowed_not = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+                0xBE82_086A, // s_not_b64 s[2:3], vcc
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let st_not = structure(&narrowed_not).unwrap();
+        let s2 = narrowed_not.blocks[0].insts[2].write(Reg::S(2)).unwrap();
+        assert!(!st_not.active.contains(&s2));
     }
 }

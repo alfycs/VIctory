@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_threads([1, 1, 1], body)
+}
+
+fn build_valu_cs_threads(threads: [u32; 3], body: &[u32]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -117,7 +121,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads,
         }),
         code,
     };
@@ -172,18 +176,34 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_inner(shader, cases, false, check);
+}
+
+fn run_cases_inner(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    allow_warp_wave_size_skip: bool,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            Err(e) if allow_warp_wave_size_skip && (warp || force_warp) => {
+                eprintln!("{label}: WaveSize compute skipped ({e})");
+                ran += 1;
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -936,4 +956,73 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn active_sop_and_loop_phi_masks_match_hardware() {
+    // s_xor_b32 after a scalar branch before any EXEC read in that block.
+    let xor_after_branch = build_valu_cs_threads(
+        [32, 1, 1],
+        &[
+            0x7D88_0000,              // v_cmp_gt_u32 vcc, s0, v0 (v0 < s0)
+            0xBF06_0000,              // s_cmp_eq_u32 s0, s0
+            0xBF84_0001,              // s_cbranch_scc0 -> skip
+            0xBF82_0000,              // s_branch -> next (forces block boundary)
+            sop2(0x12, 6, 106, 0xC1), // s_xor_b32 s6, vcc_lo, -1
+            vop1(0x001, 0, sgpr(6)),  // v_mov_b32 v0, s6
+        ],
+    );
+    // Scalar branch joining two active masks in non-EXEC phi s6, then reading s6 as data.
+    let if_else_mask_phi = build_valu_cs_threads(
+        [32, 1, 1],
+        &[
+            0xBF06_8001,             // s_cmp_eq_u32 s1, 0
+            0xBF84_0003,             // s_cbranch_scc0 -> else
+            0x7D88_0000,             // then: v_cmp_gt_u32 vcc, s0, v0 (v0 < s0)
+            s_mov_b32(6, 106),       // s6 = vcc_lo
+            0xBF82_0002,             // s_branch -> merge
+            0x7D84_0000,             // else: v_cmp_eq_u32 vcc, s0, v0 (v0 == s0)
+            s_mov_b32(6, 106),       // s6 = vcc_lo
+            vop1(0x001, 0, sgpr(6)), // merge: v0 = s6
+        ],
+    );
+
+    let counts = [0u32, 1, 5, 17, 32];
+    let inputs: Vec<[u32; 4]> = counts.iter().map(|&n| [n, 0, 0, 0]).collect();
+    run_cases_inner(&xor_after_branch, &inputs, true, |backend, i, inp, got| {
+        let low = if inp[0] >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << inp[0]) - 1
+        };
+        let want = !low;
+        assert_eq!(
+            got, want,
+            "{backend}: xor_after_branch case {i} (n={}): got {got:#010x}, want {want:#010x}",
+            inp[0]
+        );
+    });
+    let join_cases: &[(u32, u32, u32)] = &[
+        (0, 0, 0),
+        (5, 0, 0x1F),
+        (17, 0, 0x1_FFFF),
+        (32, 0, u32::MAX),
+        (0, 1, 1),
+        (5, 1, 1 << 5),
+        (17, 1, 1 << 17),
+    ];
+    let join_inputs: Vec<[u32; 4]> = join_cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases_inner(
+        &if_else_mask_phi,
+        &join_inputs,
+        true,
+        |backend, i, inp, got| {
+            let want = join_cases[i].2;
+            assert_eq!(
+                got, want,
+                "{backend}: if_else_mask_phi case {i} (n={}, branch={}): got {got:#010x}, want {want:#010x}",
+                inp[0], inp[1]
+            );
+        },
+    );
 }
