@@ -345,6 +345,216 @@ fn divergent_early_return_taints_subsequent_blocks() {
     }
 }
 
+// Synthetic LDS ordering patterns. With a join, the writer and reader are
+// separate EXEC-masked regions; without one, both accesses stay divergent.
+fn lds_region_program(divergent_write: bool, join_between: bool, delay: bool) -> NativeProgram {
+    let mut code = vec![
+        v_mov_b32(3, inline_u(7)),
+        v_lshlrev_b32(2, inline_u(2), 0),
+        v_add_nc_u32(4, inline_u(7), 0),
+    ];
+    let mut writer_branch = None;
+    if divergent_write {
+        code.push(v_cmp_lt_u32(inline_u(31), 0)); // lanes 32..63
+        code.push(s_and_saveexec_b64(6, VCC));
+        writer_branch = Some(code.len());
+        code.push(0);
+        if delay {
+            code.push(s_mov_b32(10, inline_u(0)));
+            let top = code.len();
+            code.extend([vop2(0x0B, 4, LIT, 4), 40503]);
+            code.push(v_add_nc_u32(4, inline_u(1), 4));
+            code.push(s_add_i32(10, 10, inline_u(1)));
+            code.extend([s_cmp_lt_u32(10, LIT), 4096]);
+            let at = code.len();
+            code.push(s_cbranch_scc1((top as isize - (at + 1) as isize) as i16));
+        }
+    }
+    code.extend(ds_op(0x0D, 0, 0, 2, 4, 0)); // ds_write_b32 v2, v4
+    if join_between {
+        if let Some(at) = writer_branch.take() {
+            code[at] = s_cbranch_execz((code.len() - (at + 1)) as i16);
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        }
+        code.push(v_cmp_gt_u32(inline_u(32), 0)); // lanes 0..31
+        code.push(s_and_saveexec_b64(6, VCC));
+        let at = code.len();
+        code.push(0);
+        code.extend(ds_op(0x36, 128, 0, 2, 0, 3)); // ds_read_b32 v3, v2 offset:128
+        code[at] = s_cbranch_execz((code.len() - (at + 1)) as i16);
+    } else {
+        code.extend(ds_op(0x36, 0, 0, 2, 0, 3)); // read in the writer's divergent block
+        let at = writer_branch.expect("divergent writer");
+        code[at] = s_cbranch_execz((code.len() - (at + 1)) as i16);
+    }
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 3, 0);
+    code.push(S_ENDPGM);
+    make_cs_program(&code, [64, 1, 1], 512, false)
+}
+
+#[test]
+fn divergent_lds_without_a_uniform_fence_is_rejected() {
+    let prog = lds_region_program(true, false, false);
+    assert!(emit_cs(&prog, Wave64Mode::Native).is_ok());
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = match emit_cs(&prog, mode) {
+            Err(err) => err,
+            Ok(_) => panic!("expected an unfenceable LDS access to be refused in {mode:?}"),
+        };
+        assert!(
+            matches!(err, ShaderError::Unsupported { what, .. }
+            if what.contains("uniform LDS fence")),
+            "{mode:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn lds_regions_fence_at_uniform_joins_and_exits() {
+    for (divergent_write, delay) in [(false, false), (true, false), (true, true)] {
+        let prog = lds_region_program(divergent_write, true, delay);
+        let p = ir::build(&prog.patched_code(), prog.wave64, prog.vgprs).unwrap();
+        let res = resource::track(&p, &prog.layout, prog.stage).unwrap();
+        let io = io::raise(&p, &prog).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let (uniform, _) = super::lower::compute_uniformity(&p, &st, &res, &io.inputs);
+        let fences = super::lower::plan_lds_fences(&p, &uniform).unwrap();
+        let writer = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "ds_write_b32"))
+            .unwrap();
+        let reader = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "ds_read_b32"))
+            .unwrap();
+        assert!(!uniform[reader]);
+        assert!(
+            fences
+                .enter
+                .iter()
+                .chain(&fences.leave)
+                .all(|&b| uniform[b])
+        );
+        if divergent_write {
+            assert!(!uniform[writer]);
+            let crate::ir::Exit::Jump(join) = p.blocks[writer].exit else {
+                panic!("writer rejoins")
+            };
+            assert!(
+                fences.enter.contains(&join),
+                "the join has no LDS instruction but needs a fence"
+            );
+        } else {
+            assert!(uniform[writer]);
+            assert!(
+                fences.leave.contains(&writer),
+                "the write must finish before the divergent read"
+            );
+        }
+        for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            let mut shader = emit_cs(&prog, mode).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut validator) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                validator.validate(&mut shader.dxil).unwrap();
+            }
+        }
+    }
+}
+
+fn guarded_lds_program() -> NativeProgram {
+    let mut code = vec![
+        v_mov_b32(3, inline_u(7)),
+        v_lshlrev_b32(2, inline_u(2), 0),
+        v_add_nc_u32(4, inline_u(7), 0),
+        v_cmp_lt_u32(inline_u(31), 0),
+        s_and_saveexec_b64(6, VCC),
+    ];
+    code.extend(ds_op(0x0D, 0, 0, 2, 4, 0));
+    code.extend([
+        s_or_b64(EXEC_LO, EXEC_LO, 6),
+        v_cmp_gt_u32(inline_u(32), 0),
+        s_and_saveexec_b64(6, VCC),
+    ]);
+    code.extend(ds_op(0x36, 128, 0, 2, 0, 3));
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 3, 0);
+    code.push(S_ENDPGM);
+    make_cs_program(&code, [64, 1, 1], 512, false)
+}
+
+#[test]
+fn guarded_lds_in_a_uniform_block_stays_fenceable() {
+    let prog = guarded_lds_program();
+    let p = ir::build(&prog.patched_code(), prog.wave64, prog.vgprs).unwrap();
+    let res = resource::track(&p, &prog.layout, prog.stage).unwrap();
+    let io = io::raise(&p, &prog).unwrap();
+    let st = structure::structure(&p).unwrap();
+    assert_eq!(p.blocks.len(), 1);
+    for (i, inst) in p.blocks[0].insts.iter().enumerate() {
+        if inst.name() == "ds_write_b32" || inst.name() == "ds_read_b32" {
+            assert!(st.guards[0][i].is_some());
+        }
+    }
+    let (uniform, _) = super::lower::compute_uniformity(&p, &st, &res, &io.inputs);
+    assert_eq!(uniform, [true]);
+    let fences = super::lower::plan_lds_fences(&p, &uniform).unwrap();
+    assert!(fences.leave.contains(&0));
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        assert!(emit_cs(&prog, mode).is_ok());
+    }
+}
+
+#[test]
+fn lds_in_opposite_divergent_arms_cannot_share_a_fence() {
+    // Model the per-lane CFG directly: a writer and a reader in sibling
+    // arms have no path between them, but the host halves run concurrently.
+    let prog = guarded_lds_program();
+    let mut p = ir::build(&prog.patched_code(), prog.wave64, prog.vgprs).unwrap();
+    let writer = p.blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.name() == "ds_write_b32")
+        .unwrap()
+        .clone();
+    let reader = p.blocks[0]
+        .insts
+        .iter()
+        .find(|i| i.name() == "ds_read_b32")
+        .unwrap()
+        .clone();
+    let block = |preds, insts, exit| crate::ir::Block {
+        offset: 0,
+        preds,
+        phis: vec![],
+        insts,
+        exit,
+    };
+    p.blocks = vec![
+        block(
+            vec![],
+            vec![],
+            crate::ir::Exit::Branch {
+                taken: 1,
+                not_taken: 2,
+            },
+        ),
+        block(vec![0], vec![writer], crate::ir::Exit::Jump(3)),
+        block(vec![0], vec![reader], crate::ir::Exit::Jump(3)),
+        block(vec![1, 2], vec![], crate::ir::Exit::End),
+    ];
+    assert!(super::lower::plan_lds_fences(&p, &[true, false, false, true]).is_err());
+    // If the writer returns, the reader's suffix is no longer reached by
+    // the whole group; it must not get a group-sync barrier there either.
+    p.blocks[1].exit = crate::ir::Exit::End;
+    p.blocks[3].preds = vec![2];
+    assert!(super::lower::plan_lds_fences(&p, &[true, false, false, false]).is_err());
+}
+
 #[test]
 fn translate_with_handles_synthetic_wave64_container() {
     // Build genuine DXBC + XDAT(XBCH(FSSM)) Wave64 compute container with ResourceHeap param.
@@ -524,6 +734,45 @@ mod gpu {
                 }
             }
         });
+    }
+
+    #[test]
+    fn gpu_single_wave_lds_regions_are_ordered() {
+        let plain: Vec<u32> = (0..64).map(|t| if t < 32 { t + 39 } else { 7 }).collect();
+        let delayed: Vec<u32> = (0..64)
+            .map(|t| {
+                if t >= 32 {
+                    return 7;
+                }
+                let mut x = t + 39;
+                for _ in 0..4096 {
+                    x = (x & 0xFF_FFFFu32).wrapping_mul(40503).wrapping_add(1);
+                }
+                x
+            })
+            .collect();
+        for (name, prog, expected) in [
+            (
+                "delayed writer then divergent reader",
+                lds_region_program(true, true, true),
+                &delayed,
+            ),
+            (
+                "divergent writer then divergent reader",
+                lds_region_program(true, true, false),
+                &plain,
+            ),
+            (
+                "uniform writer then divergent reader",
+                lds_region_program(false, true, false),
+                &plain,
+            ),
+            ("same-block EXEC guards", guarded_lds_program(), &plain),
+        ] {
+            for _ in 0..5 {
+                run_on_hosts(name, &prog, [1, 1, 1], 64, expected, true);
+            }
+        }
     }
 
     #[test]
