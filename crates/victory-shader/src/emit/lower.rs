@@ -1853,14 +1853,45 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(self.cur, rptr))
     }
 
+    /// Reads `val` from the lowest active lane in the current host wave
+    /// where `act` holds (returns lane 0 if none is active).
+    fn host_wave_readfirstlane(&mut self, val: V, act: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lo = self.s.m.extract(c, ballot, 0);
+        let hi = self.s.m.extract(c, ballot, 1);
+        let k0 = self.s.m.i32(0);
+        let k32 = self.s.m.i32(32);
+        let bit_lo = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let bit_hi = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let hi_idx = self.s.m.bin(c, Bin::Add, bit_hi, k32);
+        let has_hi = self.s.m.cmp(c, pred::NE, hi, k0);
+        let idx = self.s.m.select(c, has_hi, hi_idx, k0);
+        let has_lo = self.s.m.cmp(c, pred::NE, lo, k0);
+        let safe_idx = self.s.m.select(c, has_lo, bit_lo, idx);
+        self.read_lane(val, safe_idx)
+    }
+
     /// Emulates `v_readfirstlane_b32(val)` across all 64 lanes of a virtual wave.
     fn emulated_readfirstlane(&mut self, val: V, guard: Option<V>) -> Result<V, Why> {
         let divergent =
             self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false);
-        if divergent && self.wave64 != Wave64Mode::Wave32 {
-            return Err("v_readfirstlane in divergent control flow");
-        }
         let act = guard.unwrap_or_else(|| self.s.m.bool(true));
+        if divergent && self.wave64 != Wave64Mode::Wave32 {
+            // shortcut: in divergent control flow, virtual lanes cannot meet
+            // at an LDS barrier; fall back to the host wave's first active
+            // lane (matching Wave32 and non-emulated host-wave lowering).
+            return Ok(self.host_wave_readfirstlane(val, act));
+        }
         if self.wave64 == Wave64Mode::Wave32 {
             let c = self.cur;
             let i32t = self.s.t.i32;
@@ -7409,27 +7440,7 @@ impl<'a> Lower<'a> {
                 }
                 self.s.flags |= flags::WAVE_OPS;
                 let r = if let Some(g) = guard {
-                    let i32t = self.s.t.i32;
-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                    let ballot = self
-                        .s
-                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
-                    let lo = self.s.m.extract(c, ballot, 0);
-                    let hi = self.s.m.extract(c, ballot, 1);
-                    let k0 = self.s.m.i32(0);
-                    let k32 = self.s.m.i32(32);
-                    let bit_lo = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
-                    let bit_hi = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
-                    let hi_idx = self.s.m.bin(c, Bin::Add, bit_hi, k32);
-                    let has_hi = self.s.m.cmp(c, pred::NE, hi, k0);
-                    let idx = self.s.m.select(c, has_hi, hi_idx, k0);
-                    let has_lo = self.s.m.cmp(c, pred::NE, lo, k0);
-                    let idx = self.s.m.select(c, has_lo, bit_lo, idx);
-                    self.read_lane(a, idx)
+                    self.host_wave_readfirstlane(a, g)
                 } else {
                     self.s.op(
                         c,

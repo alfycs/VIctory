@@ -565,8 +565,8 @@ fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
 #[test]
 fn divergent_readfirstlane_reads_its_halfs_first_lane_on_wave32() {
     // if (v0 < 32) { s4 = readfirstlane(v0); v1 = s4; } else { v1 = 0; } store(v1)
-    // Inside divergent flow the halves cannot meet at a barrier: Wave32 reads
-    // each half's own first active lane; Emulate refuses.
+    // Inside divergent flow the halves cannot meet at a barrier: Wave32 and
+    // Emulate fall back to the host wave's first active lane.
     let mut code = Vec::new();
     code.push(v_mov_b32(1, inline_u(0)));
     code.push(v_cmp_gt_u32(inline_u(32), 0)); // 32 > v0
@@ -585,10 +585,8 @@ fn divergent_readfirstlane_reads_its_halfs_first_lane_on_wave32() {
     assert!(emit_cs(&prog, Wave64Mode::Native).is_ok());
     let wave32 = emit_cs(&prog, Wave64Mode::Wave32).unwrap();
     assert_eq!(psv_wave_range(&wave32), (32, 32));
-    assert!(matches!(
-        emit_cs(&prog, Wave64Mode::Emulate),
-        Err(ShaderError::Unsupported { .. })
-    ));
+    let emu = emit_cs(&prog, Wave64Mode::Emulate).unwrap();
+    assert_eq!(psv_wave_range(&emu), (0, u32::MAX));
 }
 
 #[test]
