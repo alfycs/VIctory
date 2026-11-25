@@ -145,46 +145,60 @@ impl Host {
 
     /// All SM 6.6 D3D12 adapters available on the machine (hardware adapters
     /// unless `VICTORY_WARP=1`, followed by WARP).
+    /// Rejected adapters are logged so an empty list is diagnosable.
     #[cfg(test)]
     pub fn all_adapters() -> Vec<(String, Self)> {
         let mut out = Vec::new();
         let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain DXGI/D3D12 adapter enumeration.
         unsafe {
-            if !warp_only
-                && let Ok(factory) =
-                    CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            {
-                let mut idx = 0u32;
-                while let Ok(adapter) = factory.EnumAdapters1(idx) {
-                    idx += 1;
-                    let Ok(desc) = adapter.GetDesc1() else {
-                        continue;
-                    };
-                    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                        continue;
+            if !warp_only {
+                match CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                    Ok(factory) => {
+                        let mut idx = 0u32;
+                        while let Ok(adapter) = factory.EnumAdapters1(idx) {
+                            idx += 1;
+                            let Ok(desc) = adapter.GetDesc1() else {
+                                eprintln!("[wave64_tests] adapter {idx} skipped: GetDesc1 failed");
+                                continue;
+                            };
+                            let end = desc
+                                .Description
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.Description.len());
+                            let name = String::from_utf16_lossy(&desc.Description[..end]);
+                            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                                eprintln!("[wave64_tests] adapter {name:?} skipped: software adapter");
+                                continue;
+                            }
+                            let mut device: Option<ID3D12Device> = None;
+                            if let Err(e) =
+                                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                            {
+                                eprintln!(
+                                    "[wave64_tests] adapter {name:?} skipped: D3D12CreateDevice: {e:?}"
+                                );
+                                continue;
+                            }
+                            let Some(device) = device else {
+                                eprintln!("[wave64_tests] adapter {name:?} skipped: no device");
+                                continue;
+                            };
+                            if let Err(e) = Self::check_sm66(&device) {
+                                eprintln!("[wave64_tests] adapter {name:?} skipped: {e}");
+                                continue;
+                            }
+                            out.push((name, Host { device }));
+                        }
                     }
-                    let mut device: Option<ID3D12Device> = None;
-                    if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
-                        continue;
-                    }
-                    let Some(device) = device else {
-                        continue;
-                    };
-                    if Self::check_sm66(&device).is_ok() {
-                        let end = desc
-                            .Description
-                            .iter()
-                            .position(|&c| c == 0)
-                            .unwrap_or(desc.Description.len());
-                        let name = String::from_utf16_lossy(&desc.Description[..end]);
-                        out.push((name, Host { device }));
-                    }
+                    Err(e) => eprintln!("[wave64_tests] CreateDXGIFactory2 failed: {e:?}"),
                 }
             }
         }
-        if let Ok(warp) = Self::new(true) {
-            out.push(("WARP".to_string(), warp));
+        match Self::new(true) {
+            Ok(warp) => out.push(("WARP".to_string(), warp)),
+            Err(e) => eprintln!("[wave64_tests] WARP skipped: {e}"),
         }
         out
     }
