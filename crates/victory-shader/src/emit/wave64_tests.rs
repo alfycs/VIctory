@@ -1110,13 +1110,17 @@ mod gpu {
     use super::*;
     use crate::emit::host::{Dispatch, Draw, Host, Root, View};
 
-    fn with_hosts(f: impl FnOnce(&[(String, Host)])) {
+    fn with_hosts(name: &str, f: impl FnOnce(&[(String, Host)])) {
         static HOSTS: OnceLock<Mutex<Vec<(String, Host)>>> = OnceLock::new();
         let _one = super::super::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let lock = HOSTS.get_or_init(|| Mutex::new(Host::all_adapters()));
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_empty() {
+            eprintln!("SKIPPED {name}: no SM 6.6 adapter");
+            return;
+        }
         f(&guard);
     }
 
@@ -1129,8 +1133,7 @@ mod gpu {
         expect_native_fail: bool,
         run_native_when_supported: bool,
     ) {
-        with_hosts(|hosts| {
-            assert!(!hosts.is_empty(), "expected at least one SM 6.6 adapter");
+        with_hosts(name, |hosts| {
             for (adapter_name, host) in hosts {
                 let mut modes = vec![Wave64Mode::Emulate];
                 if host.supports_wave32() {
@@ -2224,8 +2227,7 @@ mod gpu {
             assert_eq!(psv_wave_range(&ps), (0, u32::MAX));
             assert_ne!(sfi0_flags(&ps) & 0x4000, 0);
 
-            with_hosts(|hosts| {
-                assert!(!hosts.is_empty(), "expected at least one SM 6.6 adapter");
+            with_hosts("vs_ps_readfirstlane_host_wave_contract", |hosts| {
                 for (adapter_name, host) in hosts {
                     let (root, pso) = host
                         .pipeline(&vs, &ps_pass)
