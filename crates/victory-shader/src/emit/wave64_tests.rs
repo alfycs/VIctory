@@ -563,11 +563,10 @@ fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
 }
 
 #[test]
-fn divergent_readfirstlane_reads_its_halfs_first_lane_on_wave32() {
+fn divergent_readfirstlane_preserves_the_requested_wave_range() {
     // if (v0 < 32) { s4 = readfirstlane(v0); v1 = s4; } else { v1 = 0; } store(v1)
-    // Inside divergent flow the halves cannot meet at a barrier: Wave32 reads
-    // each half's own first active lane, and Emulate reads the host wave's
-    // first active lane without a barrier.
+    // Both emulated forms can elect before the split, including on a host
+    // that cannot request Wave32.
     let mut code = Vec::new();
     code.push(v_mov_b32(1, inline_u(0)));
     code.push(v_cmp_gt_u32(inline_u(32), 0)); // 32 > v0
@@ -1641,36 +1640,48 @@ mod gpu {
 
     #[test]
     fn gpu_divergent_readfirstlane_spans_host_waves() {
-        // Two guest Wave64s. The first 40 lanes of each enter the branch.
-        // Reading the first active lane's group-thread ID must give 0 or 64,
-        // even in the part of the mask that occupies another physical wave.
-        let mut code = vec![v_mov_b32(1, inline_u(42))];
-        code.extend(v_mbcnt_lo_u32_b32(3, NEG_ONE, inline_u(0)));
-        code.extend(v_mbcnt_hi_u32_b32(3, NEG_ONE, vgpr(3)));
-        code.push(v_cmp_gt_u32(inline_u(40), 3));
-        code.push(s_and_saveexec_b64(6, VCC));
-        let branch = code.len();
-        code.push(0);
-        code.push(v_readfirstlane_b32(4, 0));
-        code.push(v_mov_b32(1, 4));
-        code[branch] = s_cbranch_execz((code.len() - branch - 1) as i16);
-        code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
-        emit_uav_store(&mut code, 1, 0);
-        code.push(S_ENDPGM);
-
-        let prog = make_cs_program(&code, [128, 1, 1], 0, false);
-        let expected: Vec<u32> = (0..128)
-            .map(|id| if id % 64 < 40 { id & !63 } else { 42 })
-            .collect();
-        run_on_hosts_modes(
-            "divergent_readfirstlane_spans_host_waves",
-            &prog,
-            [1, 1, 1],
-            128,
-            &expected,
-            true,
-            true,
-        );
+        // The source is the group-thread ID. Cover a mask spanning halves,
+        // a first active lane in the high half, and a wholly inactive wave.
+        let cases = [
+            ("first_40", v_cmp_gt_u32(inline_u(40), 3), [0..40, 64..104]),
+            ("last_25", v_cmp_lt_u32(inline_u(38), 3), [39..64, 103..128]),
+            (
+                "empty_second",
+                v_cmp_gt_u32(inline_u(40), 0),
+                [0..40, 64..64],
+            ),
+        ];
+        for (name, compare, ranges) in cases {
+            let expected: Vec<u32> = (0..128)
+                .map(|id| {
+                    ranges
+                        .iter()
+                        .find(|r| r.contains(&id))
+                        .map_or(42, |r| r.start)
+                })
+                .collect();
+            for taken in [false, true] {
+                let mut code = vec![v_mov_b32(1, inline_u(42))];
+                code.extend(v_mbcnt_lo_u32_b32(3, NEG_ONE, inline_u(0)));
+                code.extend(v_mbcnt_hi_u32_b32(3, NEG_ONE, vgpr(3)));
+                code.push(compare);
+                code.push(s_and_saveexec_b64(6, VCC));
+                if taken {
+                    code.push(sopp(0x09, 1)); // s_cbranch_execnz -> read
+                    code.push(sopp(0x02, 2)); // s_branch -> restore
+                } else {
+                    code.push(s_cbranch_execz(2)); // -> restore
+                }
+                code.push(v_readfirstlane_b32(4, 0));
+                code.push(v_mov_b32(1, 4));
+                code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+                emit_uav_store(&mut code, 1, 0);
+                code.push(S_ENDPGM);
+                let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+                let case = format!("divergent_readfirstlane_{name}_taken_{taken}");
+                run_on_hosts_modes(&case, &prog, [1, 1, 1], 128, &expected, true, true);
+            }
+        }
     }
 
     #[test]

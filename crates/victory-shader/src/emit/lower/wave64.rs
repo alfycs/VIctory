@@ -665,6 +665,77 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(self.cur, rptr))
     }
 
+    /// A read at the start of the active EXEC edge can elect across the whole
+    /// guest wave while all host waves are still together in its predecessor.
+    pub(super) fn elect_before_exec_branch(&mut self, b: usize) -> Result<(), Stop> {
+        let block = &self.x.p.blocks[b];
+        let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = self.x.st.exits[b]
+        else {
+            return Ok(());
+        };
+        let branch = block.insts.last().expect("branch instruction");
+        let (active, on_taken) = match branch.name() {
+            "s_cbranch_execz" => (not_taken, false),
+            "s_cbranch_execnz" => (taken, true),
+            _ => return Ok(()),
+        };
+        let next = &self.x.p.blocks[active];
+        if !self.uniform[b]
+            || self.uniform[active]
+            || next.preds.as_slice() != [b]
+            || self.rpo[active] <= self.rpo[b]
+        {
+            return Ok(());
+        }
+        let Some(read) = next.insts.first() else {
+            return Ok(());
+        };
+        if read.name() != "v_readfirstlane_b32"
+            || read
+                .writes
+                .first()
+                .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1))
+        {
+            return Ok(());
+        }
+        let Fields::Valu(v) = &read.fields else {
+            unreachable!()
+        };
+        let [Operand::Vector { reg, .. }] = v.src[..] else {
+            return Ok(());
+        };
+        let Some(src) = read.read(Reg::V(reg)) else {
+            return Ok(());
+        };
+        // A successor phi is unavailable here. A DPP source might itself
+        // read another lane, so leave that form to the ordinary lowering.
+        if !self.vals.contains_key(&src) || self.val_uniform[src.0 as usize] || v.dpp.is_some() {
+            return Ok(());
+        }
+        let at = read.machine.offset;
+        let Ok(value) = self.src(read, 0) else {
+            return Ok(());
+        };
+        let condition = self
+            .boolean(when, self.cur)
+            .map_err(|w| unsupported(at, w))?;
+        let enabled = if on_taken {
+            condition
+        } else {
+            let yes = self.s.m.bool(true);
+            self.s.m.bin(self.cur, Bin::Xor, condition, yes)
+        };
+        let picked = self
+            .emulated_readfirstlane(value, Some(enabled))
+            .map_err(|w| unsupported(at, w))?;
+        self.firstlane_at_entry.insert(active, picked);
+        Ok(())
+    }
+
     /// Reads `val` from the first active lane of the host hardware wave.
     pub(super) fn host_wave_readfirstlane(&mut self, val: V, act: V) -> V {
         let c = self.cur;

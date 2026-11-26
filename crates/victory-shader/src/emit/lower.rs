@@ -282,6 +282,8 @@ struct Lower<'a> {
     wave_ids: Option<(V, V, V)>,
     /// Active `begin_guarded` nesting depth (never emit barriers while > 0).
     guard_depth: u32,
+    /// First-lane reads elected by a uniform predecessor before it splits on EXEC.
+    firstlane_at_entry: HashMap<usize, V>,
     /// Masks read as data in a block other than their defining block, keyed by `def_block`.
     cross_block_masks: HashMap<Option<usize>, Vec<Value>>,
     /// Errors deferred from pre-emitted cross-block masks.
@@ -899,6 +901,7 @@ impl<'a> Lower<'a> {
             val_uniform,
             wave_ids: None,
             guard_depth: 0,
+            firstlane_at_entry: HashMap::new(),
             cross_block_masks,
             ballot_fail: HashMap::new(),
             flat: None,
@@ -1372,6 +1375,7 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.emulating_wave64() {
                 self.preemit_masks(Some(b));
+                self.elect_before_exec_branch(b)?;
             }
             if lds_fences.leave.contains(&b) {
                 self.lds_barrier(self.cur);
@@ -6670,6 +6674,11 @@ impl<'a> Lower<'a> {
                     _ => false,
                 });
                 if self.emulating_wave64() {
+                    if i == 0
+                        && let Some(v) = self.firstlane_at_entry.remove(&b)
+                    {
+                        return int(self, v);
+                    }
                     if !non_uniform {
                         return int(self, a);
                     }
