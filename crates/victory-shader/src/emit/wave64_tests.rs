@@ -1640,6 +1640,40 @@ mod gpu {
     }
 
     #[test]
+    fn gpu_divergent_readfirstlane_spans_host_waves() {
+        // Two guest Wave64s. The first 40 lanes of each enter the branch.
+        // Reading the first active lane's group-thread ID must give 0 or 64,
+        // even in the part of the mask that occupies another physical wave.
+        let mut code = vec![v_mov_b32(1, inline_u(42))];
+        code.extend(v_mbcnt_lo_u32_b32(3, NEG_ONE, inline_u(0)));
+        code.extend(v_mbcnt_hi_u32_b32(3, NEG_ONE, vgpr(3)));
+        code.push(v_cmp_gt_u32(inline_u(40), 3));
+        code.push(s_and_saveexec_b64(6, VCC));
+        let branch = code.len();
+        code.push(0);
+        code.push(v_readfirstlane_b32(4, 0));
+        code.push(v_mov_b32(1, 4));
+        code[branch] = s_cbranch_execz((code.len() - branch - 1) as i16);
+        code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+        emit_uav_store(&mut code, 1, 0);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+        let expected: Vec<u32> = (0..128)
+            .map(|id| if id % 64 < 40 { id & !63 } else { 42 })
+            .collect();
+        run_on_hosts_modes(
+            "divergent_readfirstlane_spans_host_waves",
+            &prog,
+            [1, 1, 1],
+            128,
+            &expected,
+            true,
+            true,
+        );
+    }
+
+    #[test]
     fn gpu_64_threads_empty_exec_readfirstlane_returns_lane0() {
         // GFX10 v_readfirstlane_b32 with EXEC == 0 returns lane 0's value (`v2[0] = 7`).
         let mut code = vec![
